@@ -1216,6 +1216,24 @@ gst_kvs_sink_handle_sink_event (GstCollectPads *pads,
         }
         case GST_EVENT_EOS: {
             LOG_INFO("EOS Event received in sink for " << kvssink->stream_name);
+            
+            if(data && data->kinesis_video_stream) {
+                Frame eofr = EOFR_FRAME_INITIALIZER;
+                LOG_INFO("Sending EOFR for " << kvssink->stream_name);
+                STATUS put_eofr_status = data->kinesis_video_stream->putFrame(eofr);
+                if(STATUS_FAILED(put_eofr_status)) {
+                    LOG_WARN("Failed to put EOFR for " << kvssink->stream_name);
+                }
+            } else {
+                LOG_WARN("Null argument, failed to put EOFR for " << kvssink->stream_name);
+            }
+
+
+            /* "The downstream element should forward the EOS event to its downstream peer elements.
+               This way the event will eventually reach the sinks which should then post an EOS message
+               on the bus when in PLAYING." - GStreamerDocs->Events->EOS */
+            GstMessage * message = gst_message_new_eos(GST_OBJECT_CAST (kvssink));
+            gst_element_post_message (GST_ELEMENT_CAST(kvssink), message);
             break;
         }
         default:
@@ -1281,27 +1299,6 @@ gst_kvs_sink_handle_buffer (GstCollectPads * pads,
     GstMapInfo info;
 
     info.data = NULL;
-    // eos reached
-    if (buf == NULL && track_data == NULL) {
-        LOG_INFO("Received event for " << kvssink->stream_name);
-        // Need this check in case pipeline is already being set to NULL and
-        // stream  is being or/already stopped. Although stopSync() is an idempotent call,
-        // we want to avoid an extra call. It is not possible for this callback to be invoked
-        // after stopSync() since we stop collecting on pads before invoking. But having this
-        // check anyways in case it happens
-        if (!data->streamingStopped.load()) {
-            data->kinesis_video_stream->stopSync();
-            data->streamingStopped.store(true);
-            LOG_INFO("Sending eos for " << kvssink->stream_name);
-        }
-
-        // send out eos message to gstreamer bus
-        message = gst_message_new_eos (GST_OBJECT_CAST (kvssink));
-        gst_element_post_message (GST_ELEMENT_CAST (kvssink), message);
-
-        ret = GST_FLOW_EOS;
-        goto CleanUp;
-    }
 
     if (STATUS_FAILED(stream_status)) {
         // in offline case, we cant tell the pipeline to restream the file again in case of network outage.
@@ -1404,6 +1401,11 @@ CleanUp:
 
     if (buf != NULL) {
         gst_buffer_unref (buf);
+    }
+
+    if (STATUS_FAILED(put_frame_status)) {
+        GST_ELEMENT_WARNING (kvssink, RESOURCE, WRITE, (NULL),
+                           ("put frame error occurred. Status: 0x%08x", put_frame_status));
     }
 
     return ret;
@@ -1623,15 +1625,38 @@ init_track_data(GstKvsSink *kvssink) {
 
 static GstStateChangeReturn
 gst_kvs_sink_change_state(GstElement *element, GstStateChange transition) {
+    /*
+        The below state transition cases are separated into two switch blocks:
+        one for upward (NULL->READY->PAUSED->PLAYING) transitions and one for
+        downward (PLAYING->PAUSED->READY->NULL) transitions. It is typically* necessary to
+        transition an element's parent class state after any of the element's upward
+        transitions but before any downward transitions. As per GStreamer documentation,
+        "this is necessary in order to safely handle concurrent access by multiple threads."
+        
+        https://gstreamer.freedesktop.org/documentation/plugin-development/basics/states.
+        html?gi-language=c#:~:text=Note%20that%20upwards,destroying%20allocated%20resources.
+
+        * NOTE: The gst_collect_pads_stop call should be called before calling the parent
+                element state change function in the PAUSED_TO_READY state change to ensure
+                no pad is blocked and the element can finish streaming.
+
+                https://gstreamer.freedesktop.org/documentation/base/gstcollectpads.html?gi-
+                language=c#:~:text=The%20gst_collect_pads_stop%20call%20should%20be%20called%
+                20before%20calling%20the%20parent%20element%20state%20change%20function%20in%
+                20the%20PAUSED_TO_READY%20state%20change%20to%20ensure%20no%20pad%20is%20bloc
+                ked%20and%20the%20element%20can%20finish%20streaming.
+    */
+    
     GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
     GstKvsSink *kvssink = GST_KVS_SINK (element);
     auto data = kvssink->data;
     string err_msg = "";
     ostringstream oss;
 
+    // Upward transitions
     switch (transition) {
         case GST_STATE_CHANGE_NULL_TO_READY:
-            if (kvssink->log_config_path != NULL) {
+            if(kvssink->log_config_path != NULL) {
                 log4cplus::initialize();
                 log4cplus::PropertyConfigurator::doConfigure(kvssink->log_config_path);
                 LOG_INFO("Logger config being used: " << kvssink->log_config_path);
@@ -1660,19 +1685,27 @@ gst_kvs_sink_change_state(GstElement *element, GstStateChange transition) {
         case GST_STATE_CHANGE_READY_TO_PAUSED:
             gst_collect_pads_start (kvssink->collect);
             break;
+
+        // (Downward Transition) gst_collect_pads_stop must be called prior to parent class PAUSED->READY transition.
         case GST_STATE_CHANGE_PAUSED_TO_READY:
             LOG_INFO("Stopping kvssink for " << kvssink->stream_name);
-            gst_collect_pads_stop (kvssink->collect);
+            gst_collect_pads_stop(kvssink->collect);
+            break;
+        default:
+            break;
+    }
 
-            // Need this check in case an EOS was received in the buffer handler and
-            // stream was already stopped. Although stopSync() is an idempotent call,
-            // we want to avoid an extra call
-            if (!data->streamingStopped.load()) {
-                data->kinesis_video_stream->stopSync();
-                data->streamingStopped.store(true);
-            } else {
-                LOG_INFO("Streaming already stopped for " << kvssink->stream_name);
-            }
+    // Parent class transition
+    ret = GST_ELEMENT_CLASS (parent_class)->change_state(element, transition);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        goto CleanUp;
+    }
+
+    // Downward transitions
+    switch (transition) {
+        case GST_STATE_CHANGE_PAUSED_TO_READY:
+            data->kinesis_video_stream->stopSync();
+            data->streamingStopped.store(true);
             LOG_INFO("Stopped kvssink for " << kvssink->stream_name);
             break;
         case GST_STATE_CHANGE_READY_TO_NULL:
@@ -1681,8 +1714,6 @@ gst_kvs_sink_change_state(GstElement *element, GstStateChange transition) {
         default:
             break;
     }
-
-    ret = GST_ELEMENT_CLASS (parent_class)->change_state(element, transition);
 
 CleanUp:
 
